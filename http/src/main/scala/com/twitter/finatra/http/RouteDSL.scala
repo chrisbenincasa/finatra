@@ -4,35 +4,71 @@ import com.twitter.finagle.Filter
 import com.twitter.finagle.http.Method._
 import com.twitter.finagle.http.{Method, RouteIndex}
 import com.twitter.inject.Injector
+import com.twitter.util.Var
 import scala.collection.mutable.ArrayBuffer
 
-private[http] trait RouteDSL { self =>
+private class FilteredDSL[FilterType <: HttpFilter : Manifest] extends RouteDSL {
+  override private[http] val context = {
+    val curr = contextRef()
+    val nextCtx = curr.copy(buildFilter = getBuildFilterFunc(curr.buildFilter), name = s"filter")
+    nextCtx
+  }
 
+  protected def getBuildFilterFunc(currFunc: (Injector) => HttpFilter): (Injector) => HttpFilter = {
+    (injector: Injector) => currFunc(injector).andThen(injector.instance[FilterType])
+  }
+
+  def apply(fn: => Unit): Unit = withContext(context)(fn)
+
+  override def contextWrapper[T](f: => T): T = withContext(context)(f)
+}
+
+trait MutableRouteState {
+  private[http] val context: RouteContext = RouteContext("", (_) => Filter.identity, "base")
+  private[http] lazy val contextRef = Var(context)
+}
+
+private class PrefixedDSL(prefix: String) extends RouteDSL {
+  override private[http] val context = {
+    val curr = contextRef()
+    curr.copy(prefix = curr.prefix + prefix, name = "prefix")
+  }
+
+  def apply(fn: => Unit): Unit = withContext(context)(fn)
+
+  override def contextWrapper[T](f: => T): T = withContext(context)(f)
+}
+
+private[http] case class RouteContext(prefix: String, buildFilter: (Injector) => HttpFilter, name: String)
+
+private[http] trait RouteDSL extends MutableRouteState { self =>
   private[http] val routeBuilders = ArrayBuffer[RouteBuilder[_, _]]()
   private[http] val annotations = getClass.getDeclaredAnnotations
-  /* Mutable State */
-  private[this] var routePrefix = ""
 
-  private[http] def buildFilter(injector: Injector): HttpFilter = Filter.identity
-
-  def filter[FilterType <: HttpFilter : Manifest] = new RouteDSL {
-    override val routeBuilders = self.routeBuilders
-    override val annotations = self.annotations
-    override def buildFilter(injector: Injector) = self.buildFilter(injector).andThen(injector.instance[FilterType])
+  def filter[FilterType <: HttpFilter : Manifest]: FilteredDSL[FilterType] = contextWrapper {
+    new FilteredDSL[FilterType] {
+      override private[http] val routeBuilders = self.routeBuilders
+      override private[http] val annotations = self.annotations
+      override private[http] lazy val contextRef = self.contextRef
+    }
   }
 
-  def filter(next: HttpFilter) = new RouteDSL {
-    override val routeBuilders = self.routeBuilders
-    override def buildFilter(injector: Injector) = self.buildFilter(injector).andThen(next)
+  def filter(next: HttpFilter): FilteredDSL[HttpFilter] = contextWrapper {
+    new FilteredDSL[HttpFilter] {
+      override private[http] val routeBuilders = self.routeBuilders
+      override private[http] val annotations = self.annotations
+      override private[http] lazy val contextRef = self.contextRef
+      override protected def getBuildFilterFunc(currFunc: (Injector) => HttpFilter): (Injector) => HttpFilter = {
+        (injector: Injector) => currFunc(injector).andThen(next)
+      }
+    }
   }
 
-  def prefix(value: String)(fn: => Unit): Unit = {
-    val previous = routePrefix
-    routePrefix = value
-    try {
-      fn
-    } finally {
-      routePrefix = previous
+  def prefix(value: String): PrefixedDSL = contextWrapper {
+    new PrefixedDSL(value) {
+      override private[http] val routeBuilders = self.routeBuilders
+      override private[http] val annotations = self.annotations
+      override private[http] lazy val contextRef = self.contextRef
     }
   }
 
@@ -101,21 +137,31 @@ private[http] trait RouteDSL { self =>
 
   /* Private */
 
-  private def add[RequestType: Manifest, ResponseType: Manifest](
+  private[http] def add[RequestType: Manifest, ResponseType: Manifest](
     method: Method,
     route: String,
     name: String,
     admin: Boolean,
     index: Option[RouteIndex],
-    callback: RequestType => ResponseType) = {
-    routeBuilders += new RouteBuilder(method, prefixRoute(route), name, admin, index, callback, self)
+    callback: RequestType => ResponseType) = contextWrapper {
+    routeBuilders += new RouteBuilder(method, prefixRoute(route), name, admin, index, callback, annotations, contextRef().copy())
   }
 
   private def prefixRoute(route: String): String = {
-    routePrefix match {
+    contextRef().prefix match {
       case prefix if prefix.nonEmpty && prefix.startsWith("/") => s"$prefix$route"
       case prefix if prefix.nonEmpty && !prefix.startsWith("/") => s"/$prefix$route"
       case _ => route
     }
+  }
+
+  // A function that wraps another and sets any contexts, if necessary
+  private[http] def contextWrapper[T](f: => T): T = f
+
+  private[http] def withContext[T](ctx: RouteContext)(f: => T): T = {
+    val orig = contextRef()
+    contextRef() = ctx
+    val res = try f finally contextRef() = orig
+    res
   }
 }
